@@ -1,0 +1,61 @@
+vp:
+  bin_size: 1.0 # $1/bin (XAU), V1 dùng 1.0 cho ổn định
+  value_area_pct: 0.70 # 70% volume
+  hvn_top_bins: 12 # lấy top bins để tạo HVN zones
+  lvn_bottom_bins: 12 # lấy bottom bins để tạo LVN zones
+  merge_gap_bins: 1 # merge các bin kề nhau (gap <= 1 bin)
+
+rules:
+  asia_retest_lookback_m15: 12 # 12 candles = 3 giờ
+  asia_min_retests: 2
+  vol_spike_quantile: 0.75 # tick volume spike (M15 volume) >= Q75 trong session
+  atr_period: 14
+
+  # Setup A: HVN/VAL Reaction
+  sl_atr_mult_reaction: 1.2
+  tp_atr_mult_reaction: 1.0
+
+  # Setup B: Second Entry
+  second_entry_pullback_pct: 0.5 # pullback về 50% của move từ entry đầu
+  second_entry_min_move_atr: 0.5 # move tối thiểu từ entry đầu (ATR)
+  sl_atr_mult_second_entry: 1.0
+  tp_atr_mult_second_entry: 1.5
+
+  # Setup D: VA Re-entry trap
+  va_reentry_buffer_atr: 0.15 # buffer để xác định re-entry vào VA
+  sl_atr_mult_va_trap: 1.0
+  tp_atr_mult_va_trap: 1.8
+
+  # Setup E: LVN Gap continuation
+  sl_atr_mult_gap: 1.0
+  tp_atr_mult_gap: 1.8
+  gap_buffer_atr: 0.10 # buffer trigger = 0.1*ATR
+
+sessions:
+  asia:
+    start: "06:00"
+    end: "11:00"
+  london:
+    start: "14:00"
+    end: "17:30"
+  block_us:
+    start: "18:00"
+    end: "23:59"
+
+trade_management:
+  entry_lot: 0.04
+  tp1_close_lot: 0.02
+
+  # TP1 mặc định: POC (khuyên dùng)
+  tp1_mode: "POC" # POC | MID_VA | FIXED_ATR
+  tp1_atr: 1.0 # dùng khi FIXED_ATR
+
+  # Khi TP1 hit -> kéo SL runner về BE+
+  be_plus_mode: "ATR" # ATR | POINTS
+  be_plus_atr: 0.10 # BE + 0.10*ATR
+  be_plus_points: 30 # nếu dùng POINTS
+
+  # TP2 runner: vùng profile
+  tp2_mode: "VA_OPPOSITE" # VA_OPPOSITE | HVN_NEXT | TRAIL_POC_SHIFT
+  runner_trail: false # để V2 (chưa bật)
+

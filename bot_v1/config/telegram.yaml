@@ -1,0 +1,9 @@
+enabled: true
+
+notify_on:
+  entry: true
+  exit: true
+  error: true
+  daily_stop: true
+
+rate_limit_sec: 2

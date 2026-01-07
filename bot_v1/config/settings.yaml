@@ -1,0 +1,28 @@
+app:
+  name: "BOT_XAUUSD"
+  timezone: "Asia/Ho_Chi_Minh"
+  mode: "LIVE"
+
+symbol:
+  name: "XAUUSD"
+  timeframe: "M15"
+
+sessions:
+  asia:
+    start: "06:00"
+    end: "11:00"
+  london:
+    start: "14:00"
+    end: "17:30"
+  block_us:
+    start: "18:00"
+    end: "23:59"
+
+risk:
+  risk_per_trade_pct: 0.5
+  max_daily_loss_pct: 3.0
+  max_trades_per_day: 4
+  max_consecutive_loss: 3
+
+filters:
+  max_spread_points: 50
