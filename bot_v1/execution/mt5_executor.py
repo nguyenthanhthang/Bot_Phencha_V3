@@ -3,9 +3,10 @@ MT5 Execution Module
 Handles order execution on MetaTrader 5
 """
 
+from __future__ import annotations
 import MetaTrader5 as mt5
-from typing import Optional, Dict
-from datetime import datetime
+from typing import Optional, Dict, List
+from datetime import datetime, timezone, timedelta, date
 from enum import Enum
 
 
@@ -265,5 +266,295 @@ class MT5Executor:
             })
         
         return result
+    
+    def fetch_account_snapshot(self) -> Dict:
+        """
+        Fetch account information snapshot
+        
+        Returns:
+            Dictionary with account info
+        """
+        if not self.connected:
+            if not self.connect():
+                return {"ok": False, "error": "MT5 not connected"}
+        
+        info = mt5.account_info()
+        if info is None:
+            return {"ok": False, "error": "mt5.account_info() returned None"}
+        
+        return {
+            "ok": True,
+            "login": info.login,
+            "server": info.server,
+            "currency": info.currency,
+            "balance": float(info.balance),
+            "equity": float(info.equity),
+            "margin": float(info.margin),
+            "margin_free": float(info.margin_free),
+            "margin_level": float(info.margin_level) if info.margin_level is not None else None,
+        }
+    
+    def fetch_open_positions(self, symbol: Optional[str] = None, magic: Optional[int] = None) -> List[Dict]:
+        """
+        Fetch open positions from MT5
+        
+        Args:
+            symbol: Filter by symbol (None = all symbols) - case-insensitive
+            magic: Filter by magic number (None = all)
+            
+        Returns:
+            List of position dictionaries, or list with error dict if MT5 connection issue
+        """
+        if not self.connected:
+            if not self.connect():
+                err = mt5.last_error()
+                return [{"_error": f"MT5Executor not connected | last_error={err}"}]
+        
+        # IMPORTANT: detect MT5 connection status
+        term = mt5.terminal_info()
+        if term is None:
+            err = mt5.last_error()
+            return [{"_error": f"terminal_info None | last_error={err}"}]
+        
+        # Always fetch all positions first, then filter case-insensitive
+        # This ensures we get all positions regardless of symbol case
+        positions = mt5.positions_get()
+        if positions is None:
+            err = mt5.last_error()
+            return [{"_error": f"positions_get None | last_error={err}"}]
+        
+        out = []
+        for p in positions:
+            # Filter by magic if specified
+            if magic is not None and p.magic != magic:
+                continue
+            
+            # p.type: 0=BUY, 1=SELL
+            direction = "BUY" if p.type == mt5.POSITION_TYPE_BUY else "SELL"
+            
+            # Convert time to readable string
+            try:
+                time_open = datetime.fromtimestamp(int(p.time)).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                time_open = str(p.time)
+            
+            out.append({
+                "ticket": int(p.ticket),
+                "symbol": str(p.symbol),
+                "direction": direction,
+                "lots": float(p.volume),
+                "price_open": float(p.price_open),
+                "sl": float(p.sl) if p.sl else 0.0,
+                "tp": float(p.tp) if p.tp else 0.0,
+                "profit": float(p.profit),
+                "swap": float(p.swap) if hasattr(p, 'swap') else 0.0,
+                "commission": float(p.commission) if hasattr(p, 'commission') else 0.0,
+                "time_open": time_open,
+                "magic": int(p.magic),
+                "comment": str(p.comment) if hasattr(p, 'comment') else "",
+            })
+        
+        # Filter by symbol case-insensitive if provided (after building list)
+        if symbol:
+            sym = symbol.lower()
+            out = [x for x in out if x["symbol"].lower() == sym]
+        
+        return out
 
 
+# Standalone functions for easy access (can be used without MT5Executor instance)
+def fetch_account_snapshot() -> Dict:
+    """
+    Standalone function to fetch account snapshot
+    Note: MT5 must be initialized before calling this function
+    """
+    # Check if MT5 is already initialized
+    if not mt5.initialize():
+        return {"ok": False, "error": "MT5 initialize failed"}
+    
+    info = mt5.account_info()
+    if info is None:
+        return {"ok": False, "error": "mt5.account_info() returned None"}
+    
+    return {
+        "ok": True,
+        "login": info.login,
+        "server": info.server,
+        "currency": info.currency,
+        "balance": float(info.balance),
+        "equity": float(info.equity),
+        "margin": float(info.margin),
+        "margin_free": float(info.margin_free),
+        "margin_level": float(info.margin_level) if info.margin_level is not None else None,
+    }
+
+
+def fetch_open_positions(symbol: Optional[str] = None, magic: Optional[int] = None) -> List[Dict]:
+    """
+    Standalone function to fetch open positions
+    
+    Note: MT5 must be initialized before calling this function.
+    Symbol filtering is case-insensitive.
+    Returns list with error dict if MT5 connection issue.
+    """
+    # Check if MT5 is already initialized
+    init_result = mt5.initialize()
+    if not init_result:
+        err = mt5.last_error()
+        return [{"_error": f"MT5 initialize failed | last_error={err}"}]
+    
+    # IMPORTANT: detect MT5 connection status
+    term = mt5.terminal_info()
+    if term is None:
+        err = mt5.last_error()
+        return [{"_error": f"terminal_info None | last_error={err}"}]
+    
+    # Always fetch all positions first, then filter case-insensitive
+    # This ensures we get all positions regardless of symbol case
+    positions = mt5.positions_get()
+    if positions is None:
+        err = mt5.last_error()
+        return [{"_error": f"positions_get None | last_error={err}"}]
+    
+    out = []
+    for p in positions:
+        # Filter by magic if specified
+        if magic is not None and p.magic != magic:
+            continue
+        
+        # p.type: 0=BUY, 1=SELL
+        direction = "BUY" if p.type == mt5.POSITION_TYPE_BUY else "SELL"
+        
+        # Convert time to readable string
+        try:
+            time_open = datetime.fromtimestamp(int(p.time)).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            time_open = str(p.time)
+        
+        out.append({
+            "ticket": int(p.ticket),
+            "symbol": str(p.symbol),
+            "direction": direction,
+            "lots": float(p.volume),
+            "price_open": float(p.price_open),
+            "sl": float(p.sl) if p.sl else 0.0,
+            "tp": float(p.tp) if p.tp else 0.0,
+            "profit": float(p.profit),
+            "swap": float(p.swap) if hasattr(p, 'swap') else 0.0,
+            "commission": float(p.commission) if hasattr(p, 'commission') else 0.0,
+            "time_open": time_open,
+            "magic": int(p.magic),
+            "comment": str(p.comment) if hasattr(p, 'comment') else "",
+        })
+    
+    # Filter by symbol case-insensitive if provided (after building list)
+    if symbol:
+        sym = symbol.lower()
+        out = [x for x in out if x["symbol"].lower() == sym]
+    
+    return out
+
+
+# ========== Profit from MT5 History Deals ==========
+
+def _sum_deals_profit(dt_from: datetime, dt_to: datetime) -> Dict:
+    """
+    Sum profit, swap, commission from MT5 history deals in date range
+    
+    Args:
+        dt_from: Start datetime (inclusive)
+        dt_to: End datetime (exclusive)
+        
+    Returns:
+        Dict with ok, deals count, profit, swap, commission, net
+    """
+    if not mt5.initialize():
+        return {"ok": False, "error": "MT5 not initialized"}
+    
+    deals = mt5.history_deals_get(dt_from, dt_to)
+    if deals is None:
+        err = mt5.last_error()
+        return {"ok": False, "error": f"history_deals_get None | last_error={err}"}
+    
+    profit = 0.0
+    swap = 0.0
+    commission = 0.0
+    count = 0
+    
+    for d in deals:
+        # deal.profit includes profit for that deal; commission/swap are separate
+        profit += float(getattr(d, "profit", 0.0) or 0.0)
+        swap += float(getattr(d, "swap", 0.0) or 0.0)
+        commission += float(getattr(d, "commission", 0.0) or 0.0)
+        count += 1
+    
+    net = profit + swap + commission
+    return {
+        "ok": True,
+        "deals": count,
+        "profit": profit,
+        "swap": swap,
+        "commission": commission,
+        "net": net,
+        "from": dt_from.strftime("%Y-%m-%d"),
+        "to": dt_to.strftime("%Y-%m-%d"),
+    }
+
+
+def fetch_profit_buckets(now: Optional[datetime] = None) -> Dict:
+    """
+    Fetch profit buckets from MT5 history deals:
+    today, yesterday, this_week, last_week, this_month, last_month, this_year, last_year
+    
+    Returns:
+        Dict with ok, asof timestamp, and buckets dict
+    """
+    now = now or datetime.now()
+    
+    # NOTE: MT5 expects naive datetime in local machine time; keep naive consistently
+    today = now.date()
+    
+    # Today and yesterday
+    today_start = datetime(today.year, today.month, today.day, 0, 0, 0)
+    today_end = today_start + timedelta(days=1)
+    yesterday_start = today_start - timedelta(days=1)
+    yesterday_end = today_start
+    
+    # Week: ISO, start Monday
+    iso = today.isocalendar()
+    this_week_start = today.fromisocalendar(iso.year, iso.week, 1)
+    last_week_start = this_week_start - timedelta(days=7)
+    last_week_end = this_week_start
+    
+    # Month
+    this_month_start = today.replace(day=1)
+    last_month_end = this_month_start
+    # Last month start: go back 1 day then set day=1
+    prev_month_day = this_month_start - timedelta(days=1)
+    last_month_start = prev_month_day.replace(day=1)
+    
+    # Year
+    this_year_start = today.replace(month=1, day=1)
+    last_year_end = this_year_start
+    last_year_start = today.replace(year=today.year - 1, month=1, day=1)
+    
+    def dt(d: date) -> datetime:
+        """date -> datetime start-of-day"""
+        return datetime(d.year, d.month, d.day, 0, 0, 0)
+    
+    buckets = {
+        "today": _sum_deals_profit(today_start, today_end),
+        "yesterday": _sum_deals_profit(yesterday_start, yesterday_end),
+        "this_week": _sum_deals_profit(dt(this_week_start), today_end),
+        "last_week": _sum_deals_profit(dt(last_week_start), dt(last_week_end)),
+        "this_month": _sum_deals_profit(dt(this_month_start), today_end),
+        "last_month": _sum_deals_profit(dt(last_month_start), dt(last_month_end)),
+        "this_year": _sum_deals_profit(dt(this_year_start), today_end),
+        "last_year": _sum_deals_profit(dt(last_year_start), dt(last_year_end)),
+    }
+    
+    return {
+        "ok": True,
+        "asof": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "buckets": buckets,
+    }

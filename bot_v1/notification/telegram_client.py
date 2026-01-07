@@ -1,107 +1,90 @@
 """
-Telegram Client Module
-Handles Telegram bot communication
+Telegram client for sending notifications (one-way: bot -> Telegram)
+Async-safe, can be called from sync code
 """
 
-import requests
-from typing import Optional, Dict
-import json
+import os
+import asyncio
+from dataclasses import dataclass
+from typing import Optional
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+@dataclass
+class TelegramConfig:
+    """Telegram configuration"""
+    enabled: bool
+    token: str
+    chat_id: str
+
+
+def load_telegram_config() -> TelegramConfig:
+    """Load Telegram config from environment"""
+    enabled = os.getenv("TG_ENABLED", "true").lower() == "true"
+    token = os.getenv("TG_BOT_TOKEN", "").strip()
+    chat_id_str = os.getenv("TG_ADMIN_CHAT_ID", "").strip()
+    # For backward compatibility, use first chat_id if multiple provided
+    # Note: TelegramClient is legacy, TelegramNotifier handles multiple chat IDs
+    chat_id = chat_id_str.split(",")[0].strip() if chat_id_str else ""
+    return TelegramConfig(enabled=enabled, token=token, chat_id=chat_id)
 
 
 class TelegramClient:
-    """Telegram bot client"""
+    """
+    Send messages to Telegram (one-way communication).
+    Uses HTTP API, independent of PTB polling loop.
+    Async-safe, can be called from sync code.
+    """
     
-    def __init__(self, token: str, chat_id: str):
-        """
-        Initialize Telegram client
-        
-        Args:
-            token: Bot token from @BotFather
-            chat_id: Chat ID to send messages to
-        """
-        self.token = token
-        self.chat_id = chat_id
-        self.base_url = f"https://api.telegram.org/bot{token}"
+    def __init__(self, cfg: TelegramConfig):
+        self.cfg = cfg
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
     
-    def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
-        """
-        Send text message
-        
-        Args:
-            text: Message text
-            parse_mode: Parse mode (HTML, Markdown, etc.)
-            
-        Returns:
-            True if successful
-        """
-        url = f"{self.base_url}/sendMessage"
-        payload = {
-            "chat_id": self.chat_id,
-            "text": text,
-            "parse_mode": parse_mode
-        }
+    async def _send_async(self, text: str) -> bool:
+        """Internal async send method"""
+        if not self.cfg.enabled:
+            return False
+        if not self.cfg.token or not self.cfg.chat_id:
+            return False
         
         try:
-            response = requests.post(url, json=payload, timeout=10)
-            return response.status_code == 200
-        except Exception as e:
-            print(f"Error sending Telegram message: {e}")
+            import aiohttp
+            url = f"https://api.telegram.org/bot{self.cfg.token}/sendMessage"
+            payload = {
+                "chat_id": self.cfg.chat_id,
+                "text": text,
+                "disable_web_page_preview": True,
+                "parse_mode": "HTML",
+            }
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status == 200:
+                        return True
+                    return False
+        except Exception:
+            # Silently ignore errors (or log to your logger)
             return False
     
-    def send_photo(self, photo_path: str, caption: Optional[str] = None) -> bool:
+    def send(self, text: str) -> None:
         """
-        Send photo
-        
-        Args:
-            photo_path: Path to photo file
-            caption: Photo caption
-            
-        Returns:
-            True if successful
+        Fire-and-forget send message.
+        Can be called from sync code (trading loop).
         """
-        url = f"{self.base_url}/sendPhoto"
+        if not self.cfg.enabled or not text:
+            return
         
         try:
-            with open(photo_path, 'rb') as photo:
-                files = {'photo': photo}
-                data = {"chat_id": self.chat_id}
-                if caption:
-                    data["caption"] = caption
-                
-                response = requests.post(url, files=files, data=data, timeout=10)
-                return response.status_code == 200
-        except Exception as e:
-            print(f"Error sending Telegram photo: {e}")
-            return False
-    
-    def send_document(self, document_path: str, caption: Optional[str] = None) -> bool:
-        """
-        Send document
-        
-        Args:
-            document_path: Path to document file
-            caption: Document caption
-            
-        Returns:
-            True if successful
-        """
-        url = f"{self.base_url}/sendDocument"
-        
-        try:
-            with open(document_path, 'rb') as doc:
-                files = {'document': doc}
-                data = {"chat_id": self.chat_id}
-                if caption:
-                    data["caption"] = caption
-                
-                response = requests.post(url, files=files, data=data, timeout=10)
-                return response.status_code == 200
-        except Exception as e:
-            print(f"Error sending Telegram document: {e}")
-            return False
-    
-    def test_connection(self) -> bool:
-        """Test Telegram connection"""
-        return self.send_message("🤖 Bot connection test successful!")
-
-
+            # Try to get running event loop
+            loop = asyncio.get_running_loop()
+            # If loop exists, schedule task
+            loop.create_task(self._send_async(text))
+        except RuntimeError:
+            # No running loop, create new one
+            try:
+                asyncio.run(self._send_async(text))
+            except Exception:
+                # Ignore errors silently
+                pass

@@ -59,3 +59,12 @@ trade_management:
   tp2_mode: "VA_OPPOSITE" # VA_OPPOSITE | HVN_NEXT | TRAIL_POC_SHIFT
   runner_trail: false # để V2 (chưa bật)
 
+london_mode:
+  enabled: true
+  trap_only: true               # London chỉ dùng D-trap
+  absorption_enabled: false     # tắt absorption ở London
+  asia_balanced_filter: true
+  asia_balanced_max_range_atr: 4.0     # Asia range <= 4*ATR => balanced
+  london_reentry_buffer_atr: 0.15      # buffer re-entry vào VA cho London
+  london_sl_atr_mult: 1.0              # SL chặt hơn Asia (London nhanh)
+

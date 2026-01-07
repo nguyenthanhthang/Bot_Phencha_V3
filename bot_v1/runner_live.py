@@ -1,20 +1,30 @@
 from __future__ import annotations
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional
+import time
+import threading
 
 from dotenv import load_dotenv
+import pandas as pd
 
 from utils.config_loader import load_yaml, get_nested
 from utils.logger import setup_logger
 from utils.time_utils import to_vn_time
-from execution.mt5_executor import MT5Executor
+from execution.mt5_executor import MT5Executor, OrderType, fetch_account_snapshot, fetch_open_positions, fetch_profit_buckets
 from risk.live_risk_manager import LiveRiskManager
 from volume_profile.cache import SessionProfileCache
 from strategies.vp_v1 import VPStrategyV1
 from execution.trade_manager import TradeManager
+from execution.backtest_executor import Trade
 from data.mt5_fetcher import MT5Fetcher
 from data.resample import resample_ohlc
-import pandas as pd
+from indicators import atr
+
+# Telegram integration
+from notification.bot_state import BotState
+from notification.telegram_client import TelegramClient, load_telegram_config
+from notification.telegram_notifier import TelegramNotifier
+from notification.telegram_bot import run_telegram_command_bot
 
 
 def get_account_balance(mt5_executor: MT5Executor) -> float:
@@ -30,6 +40,7 @@ def main() -> None:
     load_dotenv()  # reads .env if exists
 
     cfg = load_yaml("config/settings.yaml")
+    cfg_backtest = load_yaml("config/backtest.yaml")
     symbols = load_yaml("config/symbols.yaml")
     tg_cfg = load_yaml("config/telegram.yaml")
     cfg_vp = load_yaml("config/vp.yaml")
@@ -87,22 +98,26 @@ def main() -> None:
     cfg_all["rules"] = cfg_vp["rules"]
     cfg_all["sessions"] = cfg_vp["sessions"]
     cfg_all["risk"] = cfg["risk"]
+    cfg_all["london_mode"] = cfg_vp.get("london_mode", {})
 
     # Initialize Volume Profile cache and strategy
-    # Note: For live, you may need to load recent M1 data or fetch on-demand
-    # This is a placeholder - you'll need to implement M1 data fetching for live
     logger.info("Loading M1 data for Volume Profile...")
-    # TODO: Fetch recent M1 data (e.g., last 30 days) for VP calculation
-    # df_m1 = fetch_recent_m1_data(mt5_fetcher, symbol, days=30)
-    # For now, using empty DataFrame as placeholder
-    df_m1 = pd.DataFrame(columns=["time", "close", "volume"])
-    df_m1["time"] = pd.to_datetime(df_m1["time"], utc=True)
+    try:
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=30)
+        tf_m1 = mt5_fetcher.tf_name_to_mt5("M1")
+        df_m1 = mt5_fetcher.fetch_rates_range(symbol, tf_m1, start_date, end_date)
+        logger.info(f"Loaded M1 data: {len(df_m1)} rows from {start_date.date()} to {end_date.date()}")
+    except Exception as e:
+        logger.error(f"Failed to fetch M1 data: {e}. Using empty DataFrame.")
+        df_m1 = pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+        df_m1["time"] = pd.to_datetime(df_m1["time"], utc=True)
     
     vp_cache = SessionProfileCache(df_m1, cfg_all)
     strat = VPStrategyV1(cfg_all, sym_specs, vp_cache)
 
     # Fill model config (spread/slippage) - same as backtest
-    fill_cfg = cfg.get("fill_model", {})
+    fill_cfg = cfg_backtest.get("fill_model", {})
     spread_points = float(fill_cfg.get("fixed_spread_points", 30.0))
     slippage_mode = fill_cfg.get("slippage_mode", "OFF")
     slippage_points = float(fill_cfg.get("slippage_points", 0.0)) if slippage_mode != "OFF" else 0.0
@@ -124,142 +139,540 @@ def main() -> None:
         max_consecutive_loss=max_consec_loss,
     )
 
+    # Initialize Telegram
+    tg_cfg_telegram = load_telegram_config()
+    tg_client = TelegramClient(tg_cfg_telegram)  # Keep for backward compatibility
+    notifier = TelegramNotifier()  # New notifier with templates
+    bot_state = BotState()
+    bot_state.set(symbol=symbol, timeframe=tf)
+    
+    # Initialize ProfitTracker with initial balance
+    initial_balance = get_account_balance(mt5_executor)
+    if initial_balance <= 0:
+        initial_balance = 1000.0  # Fallback
+    bot_state.balance = initial_balance
+    bot_state.profit.initial_balance = initial_balance
+    logger.info(f"Initial balance: ${initial_balance:.2f}")
+    
+    # Close all callback for Telegram
+    def close_all_callback():
+        """Callback for /closeall command"""
+        try:
+            positions = mt5_executor.get_positions(symbol=symbol)
+            if not positions:
+                return True, "No positions to close"
+            
+            closed_count = 0
+            for pos in positions:
+                ticket = pos['ticket']
+                if mt5_executor.close_position(ticket):
+                    closed_count += 1
+            
+            # Clear tracked positions
+            open_positions.clear()
+            return True, f"Closed {closed_count} position(s)"
+        except Exception as e:
+            return False, str(e)
+    
+    # Start Telegram command bot in background thread
+    def start_telegram_thread():
+        """Start Telegram command bot in separate thread"""
+        try:
+            th = threading.Thread(
+                target=run_telegram_command_bot,
+                kwargs={"state": bot_state, "on_close_all": close_all_callback},
+                daemon=True,
+                name="TelegramBot"
+            )
+            th.start()
+            logger.info("Telegram command bot started in background thread")
+        except Exception as e:
+            logger.error(f"Failed to start Telegram bot: {e}")
+    
+    if tg_cfg_telegram.enabled:
+        start_telegram_thread()
+        # Send start notification with detailed info
+        sessions_str = f"Asia {asia_start}-{asia_end} | London {lon_start}-{lon_end} | US OFF"
+        cfg_summary = f"Lot={tm_cfg.get('entry_lot', 0.04)} | TP1 close={tm_cfg.get('tp1_close_lot', 0.02)} | MaxConsecLoss={max_consec_loss}"
+        notifier.notify_start(
+            app=app_name,
+            symbol=symbol,
+            tf=tf,
+            tz=tz,
+            sessions=sessions_str,
+            cfg_summary=cfg_summary,
+        )
+
     logger.info("Live runner started. Waiting for candles...")
     
-    # Track open positions (similar to backtest's open_trades list)
-    # In live, we track MT5 position tickets and their metadata
-    # You'll need to maintain a mapping: ticket -> Trade object (for TP1/TP2 tracking)
-    open_positions = {}  # {ticket: Trade object}
+    # Track open positions: {ticket: Trade object}
+    open_positions = {}
     
-    # TODO: Implement your candle loop here
-    # Structure similar to backtest:
-    #
-    # import time
-    # from indicators import atr
-    #
-    # while True:
-    #     # Get current M15 candle
-    #     current_time = datetime.now()
-    #     t_vn = to_vn_time(pd.Series([current_time]))[0]
-    #     cur_day = t_vn.date()
-    #
-    #     # Fetch current M15 candle data
-    #     df_m15 = fetch_current_candle(mt5_fetcher, symbol, "M15")
-    #     if df_m15.empty:
-    #         time.sleep(60)
-    #         continue
-    #
-    #     row = df_m15.iloc[-1]  # Latest candle
-    #     df_m15["time_vn"] = to_vn_time(df_m15["time"])
-    #     df_m15["atr"] = atr(df_m15, 14)
-    #
-    #     # Get current balance
-    #     balance = get_account_balance(mt5_executor)
-    #
-    #     # Check new day and reset risk state
-    #     if risk_mgr.check_new_day(cur_day):
-    #         logger.info(f"New day: {cur_day} | Balance: {balance:.2f}")
-    #         open_positions = {}  # Reset position tracking
-    #
-    #     # Manage open positions (scale-out TP logic - same as backtest)
-    #     positions = mt5_executor.get_positions(symbol=symbol)
-    #     still_open = {}
-    #
-    #     for ticket, trade_obj in open_positions.items():
-    #         # Check if position still exists in MT5
-    #         pos = next((p for p in positions if p['ticket'] == ticket), None)
-    #         if pos is None:
-    #             # Position closed externally - update consecutive loss
-    #             # Note: You'll need to track PnL when position closes
-    #             continue
-    #
-    #         # Use TradeManager to check TP1/TP2/SL (same logic as backtest)
-    #         realized, closed_all, r = tm.update_trade_on_bar(trade_obj, row, tm_cfg)
-    #
-    #         if realized != 0.0:
-    #             # Partial close (TP1) or full close
-    #             if r == "TP1_PARTIAL":
-    #                 # Partial close TP1
-    #                 mt5_executor.close_partial(ticket, trade_obj.lot_tp1)
-    #                 # Modify SL to BE+
-    #                 mt5_executor.modify_sl(ticket, trade_obj.sl_after_tp1)
-    #                 logger.info(f"TP1 hit: Partial close {trade_obj.lot_tp1} lot, SL moved to BE+")
-    #
-    #             elif closed_all:
-    #                 # Full close (SL, TP1_FULL, TP2)
-    #                 mt5_executor.close_position(ticket)
-    #                 pnl = realized  # Use realized PnL
-    #                 risk_mgr.update_consecutive_loss(pnl)
-    #                 logger.info(f"Position closed: {r} | PnL: {pnl:.2f}")
-    #                 del open_positions[ticket]
-    #                 continue
-    #
-    #         still_open[ticket] = trade_obj
-    #
-    #     open_positions = still_open
-    #
-    #     # Entry checks: block if day_blocked, max trades, or consecutive loss
-    #     can_open, reason = risk_mgr.can_open_new_trade()
-    #     if not can_open:
-    #         if reason == "max_consecutive_loss":
-    #             logger.info(f"Consecutive loss stop: {risk_mgr.consec_loss} >= {max_consec_loss} (blocked until next day)")
-    #         continue  # Skip entry
-    #
-    #     # Check for signal (same as backtest)
-    #     if len(open_positions) == 0:  # Only one position at a time
-    #         # Get signal from strategy
-    #         sig = strat.get_signal(len(df_m15) - 1, df_m15, balance)
-    #         if sig:
-    #             # Apply entry fill (spread + slippage) - same as backtest
-    #             entry_price_filled = tm.apply_entry_fill(sig.direction, float(sig.entry_price))
-    #
-    #             # Get TP1/TP2 from signal
-    #             entry_lot = float(tm_cfg.get("entry_lot", 0.04))
-    #             tp1_lot = float(tm_cfg.get("tp1_close_lot", 0.02))
-    #
-    #             tp1_mode = tm_cfg.get("tp1_mode", "POC")
-    #             if sig.tp1 is not None:
-    #                 tp1_price = float(sig.tp1)
-    #             else:
-    #                 tp1_price = float(sig.tp)  # fallback
-    #
-    #             tp2_price = float(sig.tp2) if sig.tp2 is not None else float(sig.tp)
-    #
-    #             # Open position via MT5
-    #             order_type = MT5Executor.OrderType.BUY if sig.direction == "BUY" else MT5Executor.OrderType.SELL
-    #             ticket = mt5_executor.place_market_order(
-    #                 symbol=symbol,
-    #                 order_type=order_type,
-    #                 volume=entry_lot,
-    #                 stop_loss=sig.sl,
-    #                 take_profit=tp2_price,  # Set TP2 as initial TP (will modify after TP1)
-    #                 comment=f"VP_{sig.reason}",
-    #             )
-    #
-    #             if ticket:
-    #                 # Create Trade object for tracking (same structure as backtest)
-    #                 from execution.backtest_executor import Trade
-    #                 trade_obj = Trade(
-    #                     direction=sig.direction,
-    #                     entry_time=current_time.isoformat(),
-    #                     entry_price=entry_price_filled,
-    #                     sl=float(sig.sl),
-    #                     tp=float(tp2_price),
-    #                     lot=entry_lot,
-    #                     lot_open=entry_lot,
-    #                     lot_tp1=tp1_lot,
-    #                     tp1=tp1_price,
-    #                     tp2=tp2_price,
-    #                     setup="D",  # Extract from reason
-    #                     reason=sig.reason,
-    #                 )
-    #                 open_positions[ticket] = trade_obj
-    #                 risk_mgr.record_new_trade()
-    #                 logger.info(f"Opened {sig.direction} position: ticket={ticket}, lot={entry_lot}, entry={entry_price_filled:.2f}")
-    #
-    #     time.sleep(60)  # Wait for next candle
-
-    logger.info("Live runner stopped")
+    # Daily state tracking
+    day_start_balance = None
+    day_start_pnl = 0.0
+    
+    # Get M15 timeframe for fetching
+    tf_m15 = mt5_fetcher.tf_name_to_mt5("M15")
+    
+    # Main trading loop
+    last_candle_time = None
+    last_mt5_pull = 0.0
+    MT5_PULL_INTERVAL = 3.0  # Pull MT5 snapshot every 3 seconds
+    last_profit_pull = 0.0
+    PROFIT_PULL_INTERVAL = 60.0  # Pull MT5 profit history every 60 seconds
+    
+    try:
+        while True:
+            current_time = datetime.now()
+            now_ts = time.time()
+            t_vn = to_vn_time(pd.Series([current_time]))[0]
+            cur_day = t_vn.date()
+            
+            # Fetch recent M15 candles
+            try:
+                end_date = current_time
+                start_date = end_date - timedelta(days=7)
+                df_m15 = mt5_fetcher.fetch_rates_range(symbol, tf_m15, start_date, end_date)
+                
+                if df_m15.empty:
+                    logger.warning("No M15 data available. Waiting...")
+                    time.sleep(60)
+                    continue
+                
+                # Check if new candle
+                df_m15["time"] = pd.to_datetime(df_m15["time"], utc=True)
+                df_m15 = df_m15.sort_values("time").reset_index(drop=True)
+                latest_candle_time = df_m15.iloc[-1]["time"]
+                
+                # Skip if same candle
+                if last_candle_time is not None and latest_candle_time == last_candle_time:
+                    time.sleep(10)
+                    continue
+                
+                last_candle_time = latest_candle_time
+                
+                # Process timezone and indicators
+                df_m15["time_vn"] = to_vn_time(df_m15["time"])
+                df_m15["atr"] = atr(df_m15, int(cfg_vp["rules"]["atr_period"]))
+                df_m15 = df_m15.dropna().reset_index(drop=True)
+                
+                if len(df_m15) == 0:
+                    time.sleep(60)
+                    continue
+                
+                row = df_m15.iloc[-1]
+                t_vn = row["time_vn"]
+                cur_day = t_vn.date()
+                
+                # Get current balance
+                balance = get_account_balance(mt5_executor)
+                
+                # Check new day and reset risk state
+                if risk_mgr.check_new_day(cur_day):
+                    logger.info(f"New day: {cur_day} | Balance: {balance:.2f}")
+                    open_positions = {}
+                    day_start_balance = balance
+                    day_start_pnl = 0.0
+                    bot_state.set(
+                        pnl_today=0.0,
+                        trades_today=0,
+                        win_today=0,
+                        loss_today=0,
+                        day_blocked=False,
+                    )
+                
+                # Manage open positions
+                positions = mt5_executor.get_positions(symbol=symbol)
+                
+                # Update bot state with positions snapshot
+                positions_snapshot = []
+                for pos in positions:
+                    # Find corresponding trade_obj if tracked
+                    trade_obj = open_positions.get(pos['ticket'])
+                    positions_snapshot.append({
+                        'ticket': pos['ticket'],
+                        'symbol': pos['symbol'],
+                        'side': pos['type'],
+                        'lot': pos['volume'],
+                        'entry': pos['price_open'],
+                        'sl': pos['sl'],
+                        'tp': pos['tp'],
+                        'tp1': trade_obj.tp1 if trade_obj and trade_obj.tp1 else 0.0,
+                        'tp2': trade_obj.tp2 if trade_obj and trade_obj.tp2 else 0.0,
+                        'pnl': pos['profit'],
+                    })
+                bot_state.set(positions=positions_snapshot)
+                
+                # Check for new positions from MT5 (not tracked by bot)
+                tracked_tickets = set(open_positions.keys())
+                mt5_tickets = {p['ticket'] for p in positions}
+                new_tickets = mt5_tickets - tracked_tickets
+                
+                if new_tickets:
+                    logger.info(f"Detected {len(new_tickets)} new position(s) from MT5: {new_tickets}")
+                    for ticket in new_tickets:
+                        pos = next((p for p in positions if p['ticket'] == ticket), None)
+                        if pos:
+                            logger.info(f"  New position: Ticket={ticket}, Type={pos['type']}, Volume={pos['volume']}, Entry={pos['price_open']:.2f}, SL={pos['sl']:.2f}, TP={pos['tp']:.2f}")
+                
+                still_open = {}
+                
+                if len(open_positions) > 0:
+                    logger.info(f"Managing {len(open_positions)} tracked position(s)...")
+                
+                for ticket, trade_obj in open_positions.items():
+                    pos = next((p for p in positions if p['ticket'] == ticket), None)
+                    if pos is None:
+                        logger.warning(f"Position {ticket} closed externally")
+                        continue
+                    
+                    # Log position status
+                    current_price = pos.get("price_current", 0.0)
+                    current_profit = pos.get("profit", 0.0)
+                    logger.info(f"  Position {ticket}: {trade_obj.direction} | Entry: {trade_obj.entry_price:.2f} | Current: {current_price:.2f} | PnL: ${current_profit:.2f}")
+                    logger.info(f"    SL: {trade_obj.sl:.2f} | TP1: {trade_obj.tp1:.2f} (hit: {trade_obj.tp1_hit}) | TP2: {trade_obj.tp2:.2f} | Lot open: {trade_obj.lot_open:.2f}")
+                    
+                    # Create bar dict for TradeManager
+                    bar = {
+                        "high": float(row["high"]),
+                        "low": float(row["low"]),
+                        "close": float(row["close"]),
+                        "atr": float(row["atr"]) if "atr" in row else 1.0,
+                    }
+                    
+                    # Use TradeManager to check TP1/TP2/SL
+                    realized, closed_all, r = tm.update_trade_on_bar(trade_obj, bar, tm_cfg)
+                    
+                    if realized != 0.0:
+                        if r == "TP1_PARTIAL":
+                            logger.info(f"  TP1 HIT! Partial close {trade_obj.lot_tp1} lot at {trade_obj.tp1:.2f}")
+                            if mt5_executor.close_partial(ticket, trade_obj.lot_tp1):
+                                if mt5_executor.modify_sl(ticket, trade_obj.sl_after_tp1):
+                                    runner_lot = trade_obj.lot_open - trade_obj.lot_tp1
+                                    logger.info(f"  TP1 executed: Closed {trade_obj.lot_tp1} lot | SL moved to BE+ {trade_obj.sl_after_tp1:.2f} | Runner: {runner_lot:.2f} lot")
+                                    
+                                    # Telegram notification: TP1
+                                    notifier.notify_tp1({
+                                        "direction": trade_obj.direction,
+                                        "setup": trade_obj.setup,
+                                        "tp1": trade_obj.tp1,
+                                        "closed_lot": trade_obj.lot_tp1,
+                                        "runner_lot": runner_lot,
+                                        "new_sl": trade_obj.sl_after_tp1,
+                                        "pnl_part": realized,
+                                    })
+                                else:
+                                    logger.warning(f"  Failed to modify SL to BE+ for ticket {ticket}")
+                            else:
+                                logger.error(f"  Failed to partial close TP1 for ticket {ticket}")
+                        
+                        elif closed_all:
+                            actual_pnl = pos.get("profit", 0.0)
+                            logger.info(f"  {r} HIT! Closing position {ticket}...")
+                            if mt5_executor.close_position(ticket):
+                                risk_mgr.update_consecutive_loss(actual_pnl)
+                                status = risk_mgr.get_status()
+                                
+                                # Update daily stats
+                                day_start_pnl += actual_pnl
+                                bot_state.set(
+                                    pnl_today=day_start_pnl,
+                                    trades_today=bot_state.trades_today + 1,
+                                )
+                                if actual_pnl > 0:
+                                    bot_state.set(win_today=bot_state.win_today + 1)
+                                else:
+                                    bot_state.set(loss_today=bot_state.loss_today + 1)
+                                
+                                # Update last trade
+                                bot_state.set(last_trade={
+                                    'direction': trade_obj.direction,
+                                    'setup': trade_obj.setup,
+                                    'entry': trade_obj.entry_price,
+                                    'exit': pos.get('price_current', 0.0),
+                                    'pnl': actual_pnl,
+                                    'reason': r,
+                                    'time': current_time.strftime("%Y-%m-%d %H:%M:%S"),
+                                })
+                                
+                                logger.info(f"  Position CLOSED: {r} | PnL: ${actual_pnl:.2f}")
+                                logger.info(f"  Risk Status: ConsecLoss={status['consec_loss']}/{max_consec_loss}")
+                                
+                                # Add to ProfitTracker
+                                close_time = datetime.now()
+                                bot_state.profit.add_closed_trade(close_time=close_time, pnl_usd=actual_pnl)
+                                
+                                # Telegram notification: EXIT
+                                exit_price = pos.get('price_current', trade_obj.entry_price)
+                                notifier.notify_close({
+                                    "direction": trade_obj.direction,
+                                    "setup": trade_obj.setup,
+                                    "reason": r,
+                                    "exit_price": exit_price,
+                                    "pnl": actual_pnl,
+                                    "balance": balance,
+                                    "consec_loss": status['consec_loss'],
+                                })
+                                
+                                del open_positions[ticket]
+                                continue
+                            else:
+                                logger.error(f"  Failed to close position {ticket}")
+                    
+                    still_open[ticket] = trade_obj
+                
+                open_positions = still_open
+                
+                # Determine session
+                hour_min = t_vn.strftime("%H:%M")
+                session_name = "OUTSIDE"
+                if asia_start <= hour_min <= asia_end:
+                    session_name = "ASIA"
+                elif lon_start <= hour_min <= lon_end:
+                    session_name = "LONDON"
+                
+                # Pull MT5 snapshot periodically (every 3 seconds)
+                if now_ts - last_mt5_pull >= MT5_PULL_INTERVAL:
+                    try:
+                        # Use MT5Executor instance methods to ensure proper connection
+                        acc = mt5_executor.fetch_account_snapshot()
+                        
+                        # Fetch positions with case-insensitive symbol filter
+                        # Pass symbol directly to method (it will filter case-insensitive internally)
+                        pos = mt5_executor.fetch_open_positions(symbol=symbol)
+                        
+                        # Check for errors in positions list
+                        pos_errors = [p for p in pos if "_error" in p]
+                        pos_valid = [p for p in pos if "_error" not in p]
+                        
+                        if pos_errors:
+                            for err_dict in pos_errors:
+                                logger.error(f"MT5 positions error: {err_dict.get('_error')}")
+                        
+                        # Log for debugging
+                        logger.info(f"MT5 snapshot pull: account_ok={acc.get('ok')}, positions_count={len(pos_valid)}")
+                        if pos_valid:
+                            for p in pos_valid:
+                                logger.info(f"  Position: #{p['ticket']} {p['symbol']} {p['direction']} {p['lots']:.2f} lot @ {p['price_open']:.2f}")
+                        
+                        # Detect new positions (not tracked by bot) - only valid positions
+                        tracked_tickets = set(open_positions.keys())
+                        mt5_tickets = {p['ticket'] for p in pos_valid}
+                        new_tickets = mt5_tickets - tracked_tickets
+                        
+                        # Notify about new external positions
+                        if new_tickets:
+                            for ticket in new_tickets:
+                                p = next((p for p in pos_valid if p['ticket'] == ticket), None)
+                                if p:
+                                    logger.info(f"🔔 NEW EXTERNAL POSITION DETECTED: #{p['ticket']} {p['symbol']} {p['direction']} {p['lots']:.2f} lot @ {p['price_open']:.2f}")
+                                    notifier.send(
+                                        f"🔔 <b>NEW EXTERNAL POSITION</b>\n"
+                                        f"Ticket: #{p['ticket']}\n"
+                                        f"Symbol: {p['symbol']} | {p['direction']}\n"
+                                        f"Lot: {p['lots']:.2f} | Entry: {p['price_open']:.2f}\n"
+                                        f"SL: {p['sl']:.2f} | TP: {p['tp']:.2f}\n"
+                                        f"Time: {p['time_open']}"
+                                    )
+                        
+                        # Store both valid positions and errors (for /status to display)
+                        bot_state.set_mt5_snapshot(acc, pos)  # Store full list including errors
+                        last_mt5_pull = now_ts
+                        
+                        # Update balance from MT5 account if available
+                        if acc.get("ok"):
+                            balance = acc.get("balance", balance)
+                    except Exception as e:
+                        logger.error(f"Failed to fetch MT5 snapshot: {e}", exc_info=True)
+                
+                # Pull MT5 profit history periodically (every 60 seconds)
+                if now_ts - last_profit_pull >= PROFIT_PULL_INTERVAL:
+                    try:
+                        profit_data = fetch_profit_buckets(now=current_time)
+                        bot_state.set_mt5_profit(profit_data)
+                        last_profit_pull = now_ts
+                        logger.debug(f"MT5 profit history updated: {profit_data.get('asof')}")
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch MT5 profit history: {e}", exc_info=True)
+                
+                # Update bot state
+                status = risk_mgr.get_status()
+                bot_state.set(
+                    paused=bot_state.paused,  # Keep current paused state
+                    day_blocked=status['day_blocked'],
+                    consec_loss=status['consec_loss'],
+                    session=session_name,
+                    balance=balance,
+                    equity=balance,  # Simple: equity = balance (can enhance later)
+                )
+                
+                # Update open_trades snapshot
+                open_trades_snapshot = []
+                for t, tr in open_positions.items():
+                    open_trades_snapshot.append({
+                        "direction": tr.direction,
+                        "setup": tr.setup,
+                        "lot_open": tr.lot_open,
+                        "entry": tr.entry_price,
+                        "sl": tr.sl,
+                        "tp1": tr.tp1,
+                        "tp2": tr.tp2,
+                    })
+                bot_state.set_open_trades(open_trades_snapshot)
+                
+                # Log candle info
+                candle_time_str = t_vn.strftime("%Y-%m-%d %H:%M:%S")
+                logger.info(f"[{session_name}] Candle: {candle_time_str} | O:{row['open']:.2f} H:{row['high']:.2f} L:{row['low']:.2f} C:{row['close']:.2f} | ATR:{row['atr']:.2f}")
+                
+                # Entry checks
+                can_open, reason = risk_mgr.can_open_new_trade()
+                if not can_open:
+                    if reason == "max_consecutive_loss":
+                        logger.info(f"Consecutive loss stop: {risk_mgr.consec_loss} >= {max_consec_loss}")
+                        # Telegram notification: STOP DAY
+                        if status['day_blocked'] and not bot_state.day_blocked:
+                            notifier.notify_stop_day(consec_loss=status['consec_loss'])
+                    elif bot_state.paused:
+                        # Bot is paused via Telegram
+                        pass
+                    time.sleep(60)
+                    continue
+                
+                # Check if bot is paused
+                if bot_state.paused:
+                    time.sleep(60)
+                    continue
+                
+                # Check for signal
+                if len(open_positions) > 0:
+                    logger.info(f"Skipping entry check: {len(open_positions)} position(s) already open")
+                else:
+                    logger.info("Checking for signals...")
+                    sig = strat.get_signal(len(df_m15) - 1, df_m15, balance)
+                    if sig:
+                        logger.info("=" * 80)
+                        logger.info(f"SIGNAL DETECTED: {sig.reason}")
+                        logger.info(f"Direction: {sig.direction} | Entry: {sig.entry_price:.2f} | SL: {sig.sl:.2f}")
+                        logger.info(f"TP1: {sig.tp1:.2f if sig.tp1 else 'N/A'} | TP2: {sig.tp2:.2f if sig.tp2 else 'N/A'}")
+                        logger.info("=" * 80)
+                        # Extract setup from reason
+                        reason_str = sig.reason
+                        setup_str = ""
+                        if "REACTION" in reason_str or "HVN_VAL" in reason_str:
+                            setup_str = "A"
+                        elif "SECOND_ENTRY" in reason_str or "SECOND" in reason_str:
+                            setup_str = "B"
+                        elif "VA_REENTRY" in reason_str or "REENTRY_TRAP" in reason_str or "VA_TRAP" in reason_str or "ABSORB" in reason_str or "TRAP" in reason_str:
+                            setup_str = "D"
+                        elif "GAP" in reason_str or "LVN_GAP" in reason_str:
+                            setup_str = "E"
+                        
+                        # Get TP1/TP2
+                        entry_lot = float(tm_cfg.get("entry_lot", 0.04))
+                        tp1_lot = float(tm_cfg.get("tp1_close_lot", 0.02))
+                        
+                        tp1_mode = tm_cfg.get("tp1_mode", "POC")
+                        if sig.tp1 is not None:
+                            tp1_price = float(sig.tp1)
+                        elif tp1_mode == "POC":
+                            tp1_price = float(sig.tp)
+                        else:
+                            atr_val = float(row["atr"])
+                            k = float(tm_cfg.get("tp1_atr", 1.0))
+                            tp1_price = float(sig.entry_price) + (k * atr_val if sig.direction == "BUY" else -k * atr_val)
+                        
+                        tp2_price = float(sig.tp2) if sig.tp2 is not None else float(sig.tp)
+                        
+                        # Apply entry fill
+                        entry_price_filled = tm.apply_entry_fill(sig.direction, float(sig.entry_price))
+                        
+                        # Open position via MT5
+                        order_type = OrderType.BUY if sig.direction == "BUY" else OrderType.SELL
+                        ticket = mt5_executor.place_market_order(
+                            symbol=symbol,
+                            order_type=order_type,
+                            volume=entry_lot,
+                            stop_loss=float(sig.sl),
+                            take_profit=tp2_price,
+                            comment=f"VP_{sig.reason}",
+                        )
+                        
+                        if ticket:
+                            trade_obj = Trade(
+                                direction=sig.direction,
+                                entry_time=current_time.isoformat(),
+                                entry_price=entry_price_filled,
+                                sl=float(sig.sl),
+                                tp=float(tp2_price if tp2_price is not None else sig.tp),
+                                lot=entry_lot,
+                                lot_open=entry_lot,
+                                lot_tp1=tp1_lot,
+                                tp1=tp1_price,
+                                tp2=tp2_price,
+                                setup=setup_str,
+                                reason=reason_str,
+                            )
+                            open_positions[ticket] = trade_obj
+                            risk_mgr.record_new_trade()
+                            logger.info("=" * 80)
+                            logger.info(f"POSITION OPENED: Ticket={ticket}")
+                            logger.info(f"{sig.direction} {entry_lot} lot @ {entry_price_filled:.2f}")
+                            logger.info(f"TP1: {tp1_price:.2f} ({tp1_lot} lot) | TP2: {tp2_price:.2f} ({entry_lot - tp1_lot} lot)")
+                            logger.info(f"SL: {sig.sl:.2f}")
+                            logger.info("=" * 80)
+                            
+                            # Telegram notification: ENTRY
+                            notifier.notify_open({
+                                "direction": sig.direction,
+                                "setup": setup_str,
+                                "session": session_name,
+                                "entry": entry_price_filled,
+                                "sl": float(sig.sl),
+                                "tp1": tp1_price,
+                                "tp2": tp2_price,
+                                "lot": entry_lot,
+                                "reason": reason_str,
+                            })
+                            
+                            # Update open_trades in bot_state
+                            open_trades_snapshot = []
+                            for t, tr in open_positions.items():
+                                open_trades_snapshot.append({
+                                    "direction": tr.direction,
+                                    "setup": tr.setup,
+                                    "lot_open": tr.lot_open,
+                                    "entry": tr.entry_price,
+                                    "sl": tr.sl,
+                                    "tp1": tr.tp1,
+                                    "tp2": tr.tp2,
+                                })
+                            bot_state.set_open_trades(open_trades_snapshot)
+                    else:
+                        logger.info("No signal")
+            
+            except KeyboardInterrupt:
+                logger.info("Received interrupt signal. Shutting down...")
+                notifier.send(
+                    "🛑 <b>BOT STOPPED</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "⏹️ Keyboard interrupt\n"
+                    f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+                break
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Error in trading loop: {e}", exc_info=True)
+                bot_state.set(last_error=error_msg)
+                
+                # Telegram notification: ERROR
+                notifier.notify_error(err=error_msg)
+                time.sleep(60)
+    
+    finally:
+        mt5_executor.disconnect()
+        mt5_fetcher.shutdown()
+        logger.info("Live runner stopped")
 
 
 if __name__ == "__main__":

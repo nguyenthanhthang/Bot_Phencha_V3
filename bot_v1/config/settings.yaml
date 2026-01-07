@@ -4,7 +4,7 @@ app:
   mode: "LIVE"
 
 symbol:
-  name: "XAUUSD"
+  name: "XAUUSDm"
   timeframe: "M15"
 
 sessions:

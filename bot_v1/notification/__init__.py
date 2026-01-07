@@ -1,15 +1,14 @@
-"""Notification Module"""
+"""
+Telegram notification module for BOT_XAUUSD
+"""
 
-from .telegram_client import TelegramClient
-from .templates import MessageTemplates
-from .notifier import Notifier, TelegramNotifier, ConsoleNotifier
+from notification.bot_state import BotState
+from notification.telegram_client import TelegramClient, load_telegram_config
+from notification.telegram_bot import run_telegram_command_bot
 
 __all__ = [
-    'TelegramClient',
-    'MessageTemplates',
-    'Notifier',
-    'TelegramNotifier',
-    'ConsoleNotifier'
+    "BotState",
+    "TelegramClient",
+    "load_telegram_config",
+    "run_telegram_command_bot",
 ]
-
-

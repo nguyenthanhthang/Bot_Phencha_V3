@@ -34,6 +34,7 @@ def main():
     cfg_all["sessions"] = cfg_vp["sessions"]
     cfg_all["risk"] = cfg_settings["risk"]
     cfg_all["account"] = cfg_backtest["account"]
+    cfg_all["london_mode"] = cfg_vp.get("london_mode", {})  # London mode config
 
     path_m1 = "data_cache/XAUUSDm_M1_2025-01-01_2026-01-01.csv"
     path_m15 = "data_cache/XAUUSDm_M15_2025-01-01_2026-01-01.csv"

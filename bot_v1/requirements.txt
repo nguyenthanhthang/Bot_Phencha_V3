@@ -4,3 +4,5 @@ numpy
 pyyaml
 requests
 python-dotenv
+python-telegram-bot==21.6
+aiohttp
