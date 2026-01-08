@@ -61,9 +61,11 @@ def main() -> None:
     max_consec_loss = int(risk_cfg.get("max_consecutive_loss", 3))
 
     asia_start = get_nested(cfg, "sessions.asia.start", "06:00")
-    asia_end = get_nested(cfg, "sessions.asia.end", "11:00")
+    asia_end = get_nested(cfg, "sessions.asia.end", "13:50")
     lon_start = get_nested(cfg, "sessions.london.start", "14:00")
     lon_end = get_nested(cfg, "sessions.london.end", "17:30")
+    us_start = get_nested(cfg, "sessions.us.start", "18:00")
+    us_end = get_nested(cfg, "sessions.us.end", "23:00")
 
     sym_specs = symbols.get(symbol, {})
     min_lot = sym_specs.get("min_lot", None)
@@ -72,7 +74,7 @@ def main() -> None:
     logger.info("Boot LIVE runner OK")
     logger.info(f"App: {app_name} | TZ: {tz}")
     logger.info(f"Symbol: {symbol} | TF: {tf}")
-    logger.info(f"Sessions: Asia {asia_start}-{asia_end} | London {lon_start}-{lon_end}")
+    logger.info(f"Sessions: Asia {asia_start}-{asia_end} | London {lon_start}-{lon_end} | US {us_start}-{us_end}")
     logger.info(
         f"Risk: {risk_trade}%/trade | MaxConsecLoss: {max_consec_loss}"
     )
@@ -99,6 +101,7 @@ def main() -> None:
     cfg_all["sessions"] = cfg_vp["sessions"]
     cfg_all["risk"] = cfg["risk"]
     cfg_all["london_mode"] = cfg_vp.get("london_mode", {})
+    cfg_all["us_mode"] = cfg_vp.get("us_mode", {})
 
     # Initialize Volume Profile cache and strategy
     logger.info("Loading M1 data for Volume Profile...")
@@ -192,7 +195,7 @@ def main() -> None:
     if tg_cfg_telegram.enabled:
         start_telegram_thread()
         # Send start notification with detailed info
-        sessions_str = f"Asia {asia_start}-{asia_end} | London {lon_start}-{lon_end} | US OFF"
+        sessions_str = f"Asia {asia_start}-{asia_end} | London {lon_start}-{lon_end} | US {us_start}-{us_end}"
         cfg_summary = f"Lot={tm_cfg.get('entry_lot', 0.04)} | TP1 close={tm_cfg.get('tp1_close_lot', 0.02)} | MaxConsecLoss={max_consec_loss}"
         notifier.notify_start(
             app=app_name,
@@ -218,9 +221,17 @@ def main() -> None:
     # Main trading loop
     last_candle_time = None
     last_mt5_pull = 0.0
-    MT5_PULL_INTERVAL = 3.0  # Pull MT5 snapshot every 3 seconds
+    MT5_PULL_INTERVAL = 2.0  # Pull MT5 snapshot every 2 seconds (faster for external position detection)
     last_profit_pull = 0.0
     PROFIT_PULL_INTERVAL = 60.0  # Pull MT5 profit history every 60 seconds
+    last_notified_tickets = set()  # Track already notified tickets to avoid duplicates
+    last_session_name = None  # Track previous session for session change detection
+    
+    # Health check / Heartbeat
+    last_heartbeat = 0.0
+    HEARTBEAT_INTERVAL = 1800.0  # Send heartbeat every 30 minutes (1800 seconds)
+    last_data_check_log = 0.0
+    DATA_CHECK_LOG_INTERVAL = 300.0  # Log data status every 5 minutes
     
     try:
         while True:
@@ -233,10 +244,21 @@ def main() -> None:
             try:
                 end_date = current_time
                 start_date = end_date - timedelta(days=7)
+                fetch_start_ts = time.time()
                 df_m15 = mt5_fetcher.fetch_rates_range(symbol, tf_m15, start_date, end_date)
+                fetch_duration = time.time() - fetch_start_ts
                 
                 if df_m15.empty:
-                    logger.warning("No M15 data available. Waiting...")
+                    logger.warning("⚠️ No M15 data available from MT5. Waiting...")
+                    if now_ts - last_data_check_log >= DATA_CHECK_LOG_INTERVAL:
+                        notifier.send(
+                            f"⚠️ <b>DATA WARNING</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"❌ No M15 data from MT5\n"
+                            f"🕐 {current_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                            f"🔍 Check MT5 connection"
+                        )
+                        last_data_check_log = now_ts
                     time.sleep(60)
                     continue
                 
@@ -244,11 +266,60 @@ def main() -> None:
                 df_m15["time"] = pd.to_datetime(df_m15["time"], utc=True)
                 df_m15 = df_m15.sort_values("time").reset_index(drop=True)
                 latest_candle_time = df_m15.iloc[-1]["time"]
+                latest_candle_time_vn = to_vn_time(pd.Series([latest_candle_time]))[0]
+                
+                # Calculate data staleness (how old is the latest candle)
+                # latest_candle_time is already UTC (from MT5)
+                # current_time is local time (naive), need to convert to UTC for comparison
+                import pytz
+                if current_time.tzinfo is None:
+                    # Local time (VN) -> UTC
+                    tz_vn = pytz.timezone('Asia/Ho_Chi_Minh')
+                    current_time_local = tz_vn.localize(current_time)
+                    current_time_utc = current_time_local.astimezone(pytz.UTC)
+                else:
+                    current_time_utc = current_time.astimezone(pytz.UTC)
+                
+                # Convert to pandas Timestamp for comparison
+                current_time_utc_ts = pd.Timestamp(current_time_utc)
+                data_age_minutes = (current_time_utc_ts - latest_candle_time).total_seconds() / 60.0
+                
+                # Log data status periodically (every 5 minutes)
+                if now_ts - last_data_check_log >= DATA_CHECK_LOG_INTERVAL:
+                    logger.info(
+                        f"📊 DATA STATUS: Fetched {len(df_m15)} candles | "
+                        f"Latest: {latest_candle_time_vn.strftime('%Y-%m-%d %H:%M:%S')} | "
+                        f"Age: {data_age_minutes:.1f} min | "
+                        f"Fetch time: {fetch_duration:.2f}s"
+                    )
+                    last_data_check_log = now_ts
+                    
+                    # Warning if data is stale (>20 minutes old)
+                    if data_age_minutes > 20:
+                        logger.warning(f"⚠️ STALE DATA: Latest candle is {data_age_minutes:.1f} minutes old!")
+                        notifier.send(
+                            f"⚠️ <b>STALE DATA WARNING</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"📊 Latest candle: {latest_candle_time_vn.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                            f"⏰ Age: <b>{data_age_minutes:.1f} minutes</b>\n"
+                            f"🕐 Current: {current_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"⚠️ MT5 may not be updating data"
+                        )
                 
                 # Skip if same candle
                 if last_candle_time is not None and latest_candle_time == last_candle_time:
                     time.sleep(10)
                     continue
+                
+                # New candle detected - log it
+                if last_candle_time is None or latest_candle_time != last_candle_time:
+                    logger.info(
+                        f"✅ NEW CANDLE: {latest_candle_time_vn.strftime('%Y-%m-%d %H:%M:%S')} | "
+                        f"O:{df_m15.iloc[-1]['open']:.2f} H:{df_m15.iloc[-1]['high']:.2f} "
+                        f"L:{df_m15.iloc[-1]['low']:.2f} C:{df_m15.iloc[-1]['close']:.2f} | "
+                        f"Age: {data_age_minutes:.1f} min"
+                    )
                 
                 last_candle_time = latest_candle_time
                 
@@ -304,17 +375,8 @@ def main() -> None:
                     })
                 bot_state.set(positions=positions_snapshot)
                 
-                # Check for new positions from MT5 (not tracked by bot)
-                tracked_tickets = set(open_positions.keys())
-                mt5_tickets = {p['ticket'] for p in positions}
-                new_tickets = mt5_tickets - tracked_tickets
-                
-                if new_tickets:
-                    logger.info(f"Detected {len(new_tickets)} new position(s) from MT5: {new_tickets}")
-                    for ticket in new_tickets:
-                        pos = next((p for p in positions if p['ticket'] == ticket), None)
-                        if pos:
-                            logger.info(f"  New position: Ticket={ticket}, Type={pos['type']}, Volume={pos['volume']}, Entry={pos['price_open']:.2f}, SL={pos['sl']:.2f}, TP={pos['tp']:.2f}")
+                # Note: External position detection and notification is handled in MT5 snapshot pull section
+                # (runs every 2 seconds for faster detection)
                 
                 still_open = {}
                 
@@ -324,7 +386,76 @@ def main() -> None:
                 for ticket, trade_obj in open_positions.items():
                     pos = next((p for p in positions if p['ticket'] == ticket), None)
                     if pos is None:
-                        logger.warning(f"Position {ticket} closed externally")
+                        # Position closed externally (manually or by other means)
+                        logger.warning(f"Position {ticket} closed externally - fetching PnL from MT5 history...")
+                        
+                        # Try to get actual PnL from MT5 history deals
+                        try:
+                            import MetaTrader5 as mt5
+                            # Get deals for this position ticket
+                            deals = mt5.history_deals_get(ticket=ticket)
+                            if deals and len(deals) > 0:
+                                # Sum profit, swap, commission from all deals
+                                actual_pnl = 0.0
+                                for deal in deals:
+                                    actual_pnl += float(getattr(deal, "profit", 0.0) or 0.0)
+                                    actual_pnl += float(getattr(deal, "swap", 0.0) or 0.0)
+                                    actual_pnl += float(getattr(deal, "commission", 0.0) or 0.0)
+                                
+                                # Update risk manager
+                                risk_mgr.update_consecutive_loss(actual_pnl)
+                                status = risk_mgr.get_status()
+                                
+                                # Update daily stats
+                                day_start_pnl += actual_pnl
+                                bot_state.set(
+                                    pnl_today=day_start_pnl,
+                                    trades_today=bot_state.trades_today + 1,
+                                )
+                                if actual_pnl > 0:
+                                    bot_state.set(win_today=bot_state.win_today + 1)
+                                else:
+                                    bot_state.set(loss_today=bot_state.loss_today + 1)
+                                
+                                # Update last trade
+                                exit_price = trade_obj.entry_price  # Fallback, could get from deal if needed
+                                if deals:
+                                    last_deal = deals[-1]
+                                    exit_price = float(getattr(last_deal, "price", trade_obj.entry_price))
+                                
+                                bot_state.set(last_trade={
+                                    'direction': trade_obj.direction,
+                                    'setup': trade_obj.setup,
+                                    'entry': trade_obj.entry_price,
+                                    'exit': exit_price,
+                                    'pnl': actual_pnl,
+                                    'reason': 'MANUAL',
+                                    'time': current_time.strftime("%Y-%m-%d %H:%M:%S"),
+                                })
+                                
+                                # Add to ProfitTracker
+                                close_time = datetime.now()
+                                bot_state.profit.add_closed_trade(close_time=close_time, pnl_usd=actual_pnl)
+                                
+                                # Telegram notification: EXIT (manual close)
+                                notifier.notify_close({
+                                    "direction": trade_obj.direction,
+                                    "setup": trade_obj.setup,
+                                    "reason": "MANUAL",
+                                    "exit_price": exit_price,
+                                    "pnl": actual_pnl,
+                                    "balance": balance,
+                                    "consec_loss": status['consec_loss'],
+                                })
+                                
+                                logger.info(f"  Position {ticket} closed manually | PnL: ${actual_pnl:.2f}")
+                            else:
+                                logger.warning(f"  Could not fetch deals for ticket {ticket}")
+                        except Exception as e:
+                            logger.error(f"  Failed to fetch PnL for closed position {ticket}: {e}")
+                        
+                        # Remove from tracking
+                        del open_positions[ticket]
                         continue
                     
                     # Log position status
@@ -431,6 +562,33 @@ def main() -> None:
                     session_name = "ASIA"
                 elif lon_start <= hour_min <= lon_end:
                     session_name = "LONDON"
+                elif us_start <= hour_min <= us_end:
+                    session_name = "US"
+                
+                # Check if session changed and notify on session start
+                if session_name != last_session_name and session_name != "OUTSIDE":
+                    # Check if we're at the start of the session (within first 5 minutes)
+                    session_start_times = {
+                        "ASIA": asia_start,
+                        "LONDON": lon_start,
+                        "US": us_start,
+                    }
+                    session_start = session_start_times.get(session_name)
+                    if session_start:
+                        # Check if current time is within 5 minutes of session start
+                        start_h, start_m = map(int, session_start.split(":"))
+                        current_h, current_m = map(int, hour_min.split(":"))
+                        start_minutes = start_h * 60 + start_m
+                        current_minutes = current_h * 60 + current_m
+                        time_diff = current_minutes - start_minutes
+                        
+                        # Notify if within first 5 minutes of session start
+                        if 0 <= time_diff <= 5:
+                            time_str = t_vn.strftime("%Y-%m-%d %H:%M:%S")
+                            notifier.notify_session_start(session_name, time_str)
+                            logger.info(f"📢 Session notification sent: {session_name} started at {time_str}")
+                
+                last_session_name = session_name
                 
                 # Pull MT5 snapshot periodically (every 3 seconds)
                 if now_ts - last_mt5_pull >= MT5_PULL_INTERVAL:
@@ -459,9 +617,9 @@ def main() -> None:
                         # Detect new positions (not tracked by bot) - only valid positions
                         tracked_tickets = set(open_positions.keys())
                         mt5_tickets = {p['ticket'] for p in pos_valid}
-                        new_tickets = mt5_tickets - tracked_tickets
+                        new_tickets = mt5_tickets - tracked_tickets - last_notified_tickets
                         
-                        # Notify about new external positions
+                        # Notify about new external positions (only once per ticket)
                         if new_tickets:
                             for ticket in new_tickets:
                                 p = next((p for p in pos_valid if p['ticket'] == ticket), None)
@@ -469,12 +627,20 @@ def main() -> None:
                                     logger.info(f"🔔 NEW EXTERNAL POSITION DETECTED: #{p['ticket']} {p['symbol']} {p['direction']} {p['lots']:.2f} lot @ {p['price_open']:.2f}")
                                     notifier.send(
                                         f"🔔 <b>NEW EXTERNAL POSITION</b>\n"
-                                        f"Ticket: #{p['ticket']}\n"
-                                        f"Symbol: {p['symbol']} | {p['direction']}\n"
-                                        f"Lot: {p['lots']:.2f} | Entry: {p['price_open']:.2f}\n"
-                                        f"SL: {p['sl']:.2f} | TP: {p['tp']:.2f}\n"
-                                        f"Time: {p['time_open']}"
+                                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                                        f"🎫 Ticket: <b>#{p['ticket']}</b>\n"
+                                        f"📊 Symbol: {p['symbol']} | {p['direction']}\n"
+                                        f"📦 Lot: <b>{p['lots']:.2f}</b>\n"
+                                        f"💰 Entry: <b>{p['price_open']:.2f}</b>\n"
+                                        f"🛡️ SL: {p['sl']:.2f} | TP: {p['tp']:.2f}\n"
+                                        f"🕐 Time: {p['time_open']}\n"
+                                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                                        f"<i>Manual trade detected</i>"
                                     )
+                                    last_notified_tickets.add(ticket)
+                        
+                        # Clean up old notified tickets (keep only current MT5 tickets)
+                        last_notified_tickets = last_notified_tickets & mt5_tickets
                         
                         # Store both valid positions and errors (for /status to display)
                         bot_state.set_mt5_snapshot(acc, pos)  # Store full list including errors
@@ -521,6 +687,36 @@ def main() -> None:
                     })
                 bot_state.set_open_trades(open_trades_snapshot)
                 
+                # Heartbeat notification (every 30 minutes)
+                if now_ts - last_heartbeat >= HEARTBEAT_INTERVAL:
+                    latest_candle_time_vn_check = to_vn_time(pd.Series([latest_candle_time]))[0]
+                    # Use same timezone conversion as above
+                    import pytz
+                    if current_time.tzinfo is None:
+                        tz_vn = pytz.timezone('Asia/Ho_Chi_Minh')
+                        current_time_local = tz_vn.localize(current_time)
+                        current_time_utc = current_time_local.astimezone(pytz.UTC)
+                    else:
+                        current_time_utc = current_time.astimezone(pytz.UTC)
+                    current_time_utc_ts = pd.Timestamp(current_time_utc)
+                    data_age_minutes = (current_time_utc_ts - latest_candle_time).total_seconds() / 60.0
+                    
+                    status_emoji = "✅" if data_age_minutes <= 20 else "⚠️"
+                    notifier.send(
+                        f"{status_emoji} <b>BOT HEARTBEAT</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📊 Session: <b>{session_name}</b>\n"
+                        f"📈 Latest candle: {latest_candle_time_vn_check.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        f"⏰ Data age: <b>{data_age_minutes:.1f} min</b>\n"
+                        f"💰 Balance: <b>{balance:.2f}$</b>\n"
+                        f"📦 Positions: <b>{len(open_positions)}</b>\n"
+                        f"🕐 {current_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"✅ Bot is running"
+                    )
+                    last_heartbeat = now_ts
+                    logger.info(f"💓 Heartbeat sent: Session={session_name}, Data age={data_age_minutes:.1f} min, Positions={len(open_positions)}")
+                
                 # Log candle info
                 candle_time_str = t_vn.strftime("%Y-%m-%d %H:%M:%S")
                 logger.info(f"[{session_name}] Candle: {candle_time_str} | O:{row['open']:.2f} H:{row['high']:.2f} L:{row['low']:.2f} C:{row['close']:.2f} | ATR:{row['atr']:.2f}")
@@ -554,7 +750,9 @@ def main() -> None:
                         logger.info("=" * 80)
                         logger.info(f"SIGNAL DETECTED: {sig.reason}")
                         logger.info(f"Direction: {sig.direction} | Entry: {sig.entry_price:.2f} | SL: {sig.sl:.2f}")
-                        logger.info(f"TP1: {sig.tp1:.2f if sig.tp1 else 'N/A'} | TP2: {sig.tp2:.2f if sig.tp2 else 'N/A'}")
+                        tp1_str = f"{sig.tp1:.2f}" if sig.tp1 is not None else "N/A"
+                        tp2_str = f"{sig.tp2:.2f}" if sig.tp2 is not None else "N/A"
+                        logger.info(f"TP1: {tp1_str} | TP2: {tp2_str}")
                         logger.info("=" * 80)
                         # Extract setup from reason
                         reason_str = sig.reason
@@ -653,12 +851,17 @@ def main() -> None:
             
             except KeyboardInterrupt:
                 logger.info("Received interrupt signal. Shutting down...")
-                notifier.send(
-                    "🛑 <b>BOT STOPPED</b>\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
-                    "⏹️ Keyboard interrupt\n"
-                    f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                )
+                # Use silent_fail=True to prevent network errors from crashing during shutdown
+                try:
+                    notifier.send(
+                        "🛑 <b>BOT STOPPED</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        "⏹️ Keyboard interrupt\n"
+                        f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                        silent_fail=True
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to send shutdown notification: {e}")
                 break
             except Exception as e:
                 error_msg = str(e)

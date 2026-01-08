@@ -41,10 +41,15 @@ class VPStrategyV1:
         self.cur_day = None
         self.asia_traded = False   # không còn dùng để giới hạn 1 lệnh/ngày, giữ lại cho compat
         self.london_traded = False
+        self.us_traded = False
         
         # London mode config
         london_cfg = cfg_all.get("london_mode", {})
         self.london_enabled = london_cfg.get("enabled", True)
+        
+        # US mode config (giống London)
+        us_cfg = cfg_all.get("us_mode", {})
+        self.us_enabled = us_cfg.get("enabled", True)
         
         # Track setups for second entry
         self.asia_first_entry_price = None
@@ -55,6 +60,7 @@ class VPStrategyV1:
         self.cur_day = day
         self.asia_traded = False   # reset nhưng không còn dùng để chặn entry Asia
         self.london_traded = False
+        self.us_traded = False
         self.asia_first_entry_price = None
         self.asia_first_entry_idx = None
         self.asia_setup_a_triggered = False
@@ -256,7 +262,7 @@ class VPStrategyV1:
         
         # Lọc candles Asia cùng ngày
         asia_start = self.sessions.get("asia", {}).get("start", "06:00")
-        asia_end = self.sessions.get("asia", {}).get("end", "11:00")
+        asia_end = self.sessions.get("asia", {}).get("end", "13:50")
         
         sub = df[df["time_vn"].dt.date == day].copy()
         sub_asia = sub[sub["time_vn"].apply(lambda x: in_time_range(x, asia_start, asia_end))]
@@ -502,6 +508,91 @@ class VPStrategyV1:
 
         return None
 
+    def _us_va_reentry_trap(self, i: int, df: pd.DataFrame, balance: float, pack: ProfilePack) -> Optional[Signal]:
+        """
+        US Setup D - Trap only (giống London logic).
+        Chỉ trade breakout-fail re-entry vào VA.
+        """
+        
+        us_cfg = self.cfg.get("us_mode", {})
+        buffer_atr = float(us_cfg.get("us_reentry_buffer_atr", 0.15))
+        sl_mult = float(us_cfg.get("us_sl_atr_mult", 1.0))
+        
+        row = df.iloc[i]
+        atr = float(row["atr"])
+        if atr <= 0:
+            return None
+        
+        close = float(row["close"])
+        high = float(row["high"])
+        low = float(row["low"])
+
+        val = pack.val
+        vah = pack.vah
+        poc = pack.poc
+
+        if val != val or vah != vah:  # nan check
+            return None
+        
+        # Cần đủ history cho breakout detection
+        if i < 5:
+            return None
+        
+        buffer = buffer_atr * atr
+        
+        # Lookback để tìm breakout
+        lookback = 10
+        start = max(0, i - lookback)
+        recent = df.iloc[start:i+1]
+        
+        # Tìm breakout lên trên VA
+        breakout_up = False
+        breakout_down = False
+        
+        for j in range(len(recent) - 1):
+            prev_high = float(recent.iloc[j]["high"])
+            if prev_high > (vah + buffer):
+                breakout_up = True
+                break
+        
+        for j in range(len(recent) - 1):
+            prev_low = float(recent.iloc[j]["low"])
+            if prev_low < (val - buffer):
+                breakout_down = True
+                break
+
+        # SELL trap: breakout up rồi quay lại test VA từ trên
+        if breakout_up and high >= (vah - buffer) and close < vah:
+            entry = min(close, vah)
+            sl_dist = sl_mult * atr
+            
+            # TP1 = POC, TP2 = VAL (VA edge đối diện)
+            tp1_price = poc if poc == poc else entry - (1.0 * atr)
+            tp2_price = val if val == val else entry - (1.8 * atr)
+            
+            sl = entry + sl_dist
+            tp = tp2_price
+            
+            lot = calc_lot_by_risk(balance, self.risk_pct, sl_dist, self.contract_size, self.min_lot, self.lot_step)
+            return Signal("SELL", entry, sl, tp, lot, "VP_US_VA_TRAP_SELL", tp1=tp1_price, tp2=tp2_price)
+        
+        # BUY trap: breakout down rồi quay lại test VA từ dưới
+        if breakout_down and low <= (val + buffer) and close > val:
+            entry = max(close, val)
+            sl_dist = sl_mult * atr
+            
+            # TP1 = POC, TP2 = VAH (VA edge đối diện)
+            tp1_price = poc if poc == poc else entry + (1.0 * atr)
+            tp2_price = vah if vah == vah else entry + (1.8 * atr)
+            
+            sl = entry - sl_dist
+            tp = tp2_price
+            
+            lot = calc_lot_by_risk(balance, self.risk_pct, sl_dist, self.contract_size, self.min_lot, self.lot_step)
+            return Signal("BUY", entry, sl, tp, lot, "VP_US_VA_TRAP_BUY", tp1=tp1_price, tp2=tp2_price)
+
+        return None
+
     def get_signal(self, i: int, df: pd.DataFrame, balance: float) -> Optional[Signal]:
         row = df.iloc[i]
         t_vn = row["time_vn"]
@@ -538,6 +629,20 @@ class VPStrategyV1:
             if sig_lon:
                 return sig_lon
 
-        # Ngoài Asia/London: không trade (nghỉ US)
+        # US session: chỉ dùng Setup D - Trap only (giống London logic)
+        if in_time_range(t_vn, self.sessions["us"]["start"], self.sessions["us"]["end"]):
+            if not self.us_enabled:
+                return None
+            
+            # Filter: Asia phải balanced (không trend mạnh) mới trade US (giống London)
+            if not self._asia_is_balanced(df, i):
+                return None
+            
+            pack_us = self.vp_cache.get(day, "us", self.sessions["us"]["start"], self.sessions["us"]["end"])
+            sig_us = self._us_va_reentry_trap(i, df, balance, pack_us)
+            if sig_us:
+                return sig_us
+
+        # Ngoài Asia/London/US: không trade
         return None
 

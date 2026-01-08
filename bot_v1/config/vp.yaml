@@ -34,13 +34,13 @@ rules:
 sessions:
   asia:
     start: "06:00"
-    end: "11:00"
+    end: "13:50"
   london:
     start: "14:00"
     end: "17:30"
-  block_us:
+  us:
     start: "18:00"
-    end: "23:59"
+    end: "23:00"
 
 trade_management:
   entry_lot: 0.04
@@ -67,4 +67,13 @@ london_mode:
   asia_balanced_max_range_atr: 4.0     # Asia range <= 4*ATR => balanced
   london_reentry_buffer_atr: 0.15      # buffer re-entry vào VA cho London
   london_sl_atr_mult: 1.0              # SL chặt hơn Asia (London nhanh)
+
+us_mode:
+  enabled: true
+  trap_only: true               # US chỉ dùng D-trap (giống London)
+  absorption_enabled: false     # tắt absorption ở US
+  asia_balanced_filter: true    # Filter: Asia phải balanced mới trade US
+  asia_balanced_max_range_atr: 4.0     # Asia range <= 4*ATR => balanced
+  us_reentry_buffer_atr: 0.15         # buffer re-entry vào VA cho US
+  us_sl_atr_mult: 1.0                 # SL chặt hơn Asia (US nhanh)
 

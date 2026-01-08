@@ -1,0 +1,11 @@
+XAUUSD:
+  contract_size: 100
+  min_lot: 0.01
+  lot_step: 0.01
+  digits: 2
+
+XAUUSDm:
+  contract_size: 100
+  min_lot: 0.01
+  lot_step: 0.01
+  digits: 2

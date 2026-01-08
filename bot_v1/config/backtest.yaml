@@ -14,7 +14,7 @@ account:
 sessions:
   asia:
     start: "06:00"
-    end: "11:00"
+    end: "13:50"
   london:
     start: "14:00"
     end: "17:30"

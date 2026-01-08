@@ -1,0 +1,4 @@
+stress:
+  spreads_points: [30, 40, 50, 70]
+  slippages_points: [0, 5, 10, 20]
+
