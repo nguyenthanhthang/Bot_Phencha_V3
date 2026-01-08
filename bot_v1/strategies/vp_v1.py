@@ -1,11 +1,19 @@
 from dataclasses import dataclass
 from typing import Optional
+import logging
 
 import pandas as pd
 
 from risk.position_sizing import calc_lot_by_risk
 from volume_profile.cache import SessionProfileCache, ProfilePack
 from utils.time_utils import in_time_range
+
+# Use root logger or ensure it's configured
+logger = logging.getLogger("strategies.vp_v1")
+# If no handlers, add a null handler to prevent errors
+if not logger.handlers:
+    logger.addHandler(logging.NullHandler())
+    logger.setLevel(logging.INFO)
 
 
 @dataclass
@@ -268,10 +276,16 @@ class VPStrategyV1:
         sub_asia = sub[sub["time_vn"].apply(lambda x: in_time_range(x, asia_start, asia_end))]
         
         if len(sub_asia) < 10:
+            logger.info(f"Asia balanced check: Not enough candles ({len(sub_asia)} < 10)")
             return False
         
         rng = float(sub_asia["high"].max() - sub_asia["low"].min())
-        return rng <= max_range_atr * atr
+        max_range = max_range_atr * atr
+        is_balanced = rng <= max_range
+        
+        logger.info(f"Asia balanced check: Range={rng:.2f}, MaxRange={max_range:.2f} ({max_range_atr}*ATR), Balanced={is_balanced}")
+        
+        return is_balanced
 
     def _asia_va_reentry_trap(self, i: int, df: pd.DataFrame, balance: float, pack: ProfilePack) -> Optional[Signal]:
         """
@@ -521,6 +535,7 @@ class VPStrategyV1:
         row = df.iloc[i]
         atr = float(row["atr"])
         if atr <= 0:
+            logger.debug("US trap: ATR <= 0")
             return None
         
         close = float(row["close"])
@@ -532,10 +547,12 @@ class VPStrategyV1:
         poc = pack.poc
 
         if val != val or vah != vah:  # nan check
+            logger.info(f"US trap: VP data invalid (VAL={val}, VAH={vah})")
             return None
         
         # Cần đủ history cho breakout detection
         if i < 5:
+            logger.info(f"US trap: Not enough history (i={i} < 5, need at least 5 candles)")
             return None
         
         buffer = buffer_atr * atr
@@ -560,6 +577,8 @@ class VPStrategyV1:
             if prev_low < (val - buffer):
                 breakout_down = True
                 break
+
+        logger.info(f"US trap: Price={close:.2f}, VAL={val:.2f}, VAH={vah:.2f}, POC={poc:.2f}, Breakout_up={breakout_up}, Breakout_down={breakout_down}, High={high:.2f}, Low={low:.2f}")
 
         # SELL trap: breakout up rồi quay lại test VA từ trên
         if breakout_up and high >= (vah - buffer) and close < vah:
@@ -597,12 +616,16 @@ class VPStrategyV1:
         row = df.iloc[i]
         t_vn = row["time_vn"]
         day = t_vn.date()
+        hour_min = t_vn.strftime("%H:%M")
 
         if self.cur_day != day:
             self.on_new_day(day)
 
+        logger.info(f"get_signal: i={i}, day={day}, time={hour_min}, asia_range={self.sessions['asia']['start']}-{self.sessions['asia']['end']}, london_range={self.sessions['london']['start']}-{self.sessions['london']['end']}, us_range={self.sessions['us']['start']}-{self.sessions['us']['end']}")
+
         # ASIA - Multiple setups
         if in_time_range(t_vn, self.sessions["asia"]["start"], self.sessions["asia"]["end"]):
+            logger.info(f"Asia session check: time={hour_min} is in range")
             pack = self.vp_cache.get(day, "asia", self.sessions["asia"]["start"], self.sessions["asia"]["end"])
             
             # Setup D: VA Re-entry trap (gộp với Setup A - absorption confirmation)
@@ -617,11 +640,14 @@ class VPStrategyV1:
 
         # LONDON session: chỉ dùng Setup D - Trap only (không absorption)
         if in_time_range(t_vn, self.sessions["london"]["start"], self.sessions["london"]["end"]):
+            logger.info(f"London session check: time={hour_min} is in range")
             if not self.london_enabled:
+                logger.info("London session: disabled")
                 return None
             
             # Filter: Asia phải balanced (không trend mạnh) mới trade London
             if not self._asia_is_balanced(df, i):
+                logger.info("London session: Asia not balanced (filtered out)")
                 return None
             
             pack_lon = self.vp_cache.get(day, "london", self.sessions["london"]["start"], self.sessions["london"]["end"])
@@ -631,17 +657,23 @@ class VPStrategyV1:
 
         # US session: chỉ dùng Setup D - Trap only (giống London logic)
         if in_time_range(t_vn, self.sessions["us"]["start"], self.sessions["us"]["end"]):
+            logger.info(f"US session check: time={hour_min} is in range")
             if not self.us_enabled:
+                logger.info("US session: disabled")
                 return None
             
             # Filter: Asia phải balanced (không trend mạnh) mới trade US (giống London)
-            if not self._asia_is_balanced(df, i):
+            asia_balanced = self._asia_is_balanced(df, i)
+            if not asia_balanced:
+                logger.info(f"US session: Asia not balanced (filtered out) - skipping US trade")
                 return None
             
             pack_us = self.vp_cache.get(day, "us", self.sessions["us"]["start"], self.sessions["us"]["end"])
             sig_us = self._us_va_reentry_trap(i, df, balance, pack_us)
             if sig_us:
                 return sig_us
+            else:
+                logger.info(f"US session: No trap signal (no breakout+reentry setup)")
 
         # Ngoài Asia/London/US: không trade
         return None

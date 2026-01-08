@@ -65,7 +65,7 @@ class MT5Executor:
             volume: Order volume in lots
             stop_loss: Stop loss price
             take_profit: Take profit price
-            comment: Order comment
+            comment: Order comment (will be truncated to 32 chars and sanitized)
             
         Returns:
             Order ticket if successful, None otherwise
@@ -83,6 +83,17 @@ class MT5Executor:
             if not mt5.symbol_select(symbol, True):
                 return None
         
+        # Sanitize and truncate comment (MT5 limit is usually 32-64 chars, use 32 for safety)
+        # Remove any non-ASCII or special characters that might cause issues
+        safe_comment = comment.encode('ascii', 'ignore').decode('ascii')
+        # Remove any control characters
+        safe_comment = ''.join(c for c in safe_comment if c.isprintable())
+        # Truncate to 32 characters (MT5 safe limit)
+        safe_comment = safe_comment[:32] if len(safe_comment) > 32 else safe_comment
+        # Ensure it's not empty
+        if not safe_comment:
+            safe_comment = "VP"
+        
         # Prepare order request
         if order_type == OrderType.BUY:
             price = mt5.symbol_info_tick(symbol).ask
@@ -99,7 +110,7 @@ class MT5Executor:
             "price": price,
             "deviation": 20,
             "magic": 234000,
-            "comment": comment,
+            "comment": safe_comment,
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
